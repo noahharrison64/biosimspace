@@ -469,6 +469,7 @@ class ATMSetup:
         protein_com_atoms=None,
         ligand_bound_com_atoms=None,
         ligand_free_com_atoms=None,
+        align_ligands: bool = True,
     ):
         """
         Prepare the system for an ATM simulation.
@@ -501,6 +502,11 @@ class ATMSetup:
         ligand_free_com_atoms : [int]
             A list of atom indices that define the center of mass of the free ligand.
             If None, the center of mass of the free ligand will be found automatically.
+
+        align_ligands : bool
+            If True, the ligands will be aligned before the system is prepared.
+            This is useful if the ligands are not already aligned when supplied, however 
+            consumes more time.
 
         Returns
         -------
@@ -539,7 +545,7 @@ class ATMSetup:
             # the final value will be set after the system is made, but the initial value is needed to make the system
             self._setDisplacement(displacement)
             system, prot_ind, lig1_ind, lig2_ind, dis_vec = self._makeSystemFromThree(
-                self._protein, self._ligand_bound, self._ligand_free, self._displacement
+                self._protein, self._ligand_bound, self._ligand_free, self._displacement, align_ligands
             )
             self._setSystem(system, is_prepared=False)
             self._setDisplacement(dis_vec)
@@ -566,7 +572,7 @@ class ATMSetup:
             return self._system, self.data
 
     @staticmethod
-    def _makeSystemFromThree(protein, ligand_bound, ligand_free, displacement):
+    def _makeSystemFromThree(protein, ligand_bound, ligand_free, displacement, align_ligands):
         """Create a system for ATM simulations.
 
         Parameters
@@ -583,6 +589,9 @@ class ATMSetup:
 
         displacement : BioSimSpace.Types.Length
             The displacement of the ligand along the normal vector.
+
+        align_ligands : bool
+            If True, the ligands will be aligned using _matchAtoms and _rmsdAlign.
 
         Returns
         -------
@@ -671,8 +680,13 @@ class ATMSetup:
             out_of_protein = displacement.value() * initial_normal_vector
             return out_of_protein
 
-        mapping = _matchAtoms(ligand_free, ligand_bound)
-        ligand_free_aligned = _rmsdAlign(ligand_free, ligand_bound, mapping)
+        if align_ligands:
+            #Align the free ligand to the bound ligand
+            mapping = _matchAtoms(ligand_free, ligand_bound)
+            ligand_free_aligned = _rmsdAlign(ligand_free, ligand_bound, mapping)
+        else:
+            #Ligand free is already aligned
+            ligand_free_aligned = ligand_free
         prot_lig1 = (protein + ligand_bound).toSystem()
 
         if isinstance(displacement, _Vector):
