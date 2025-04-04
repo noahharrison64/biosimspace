@@ -32,6 +32,9 @@ import shutil as _shutil
 import warnings as _warnings
 import zipfile as _zipfile
 
+import numpy as np
+from scipy import ndimage
+from scipy.spatial.distance import cdist
 from sire.legacy import IO as _SireIO
 
 from .._SireWrappers import Molecule as _Molecule
@@ -573,136 +576,169 @@ class ATMSetup:
 
     @staticmethod
     def _makeSystemFromThree(protein, ligand_bound, ligand_free, displacement, align_ligands):
-        """Create a system for ATM simulations.
-
-        Parameters
-        ----------
-
-        protein : BioSimSpace._SireWrappers.Molecule
-            The protein for the ATM simulation.
-
-        ligand_bound : BioSimSpace._SireWrappers.Molecule
-            The bound ligand for the ATM simulation.
-
-        ligand_free : BioSimSpace._SireWrappers.Molecule
-            The free ligand for the ATM simulation.
-
-        displacement : BioSimSpace.Types.Length
-            The displacement of the ligand along the normal vector.
-
-        align_ligands : bool
-            If True, the ligands will be aligned using _matchAtoms and _rmsdAlign.
-
-        Returns
-        -------
-
-        BioSimSpace._SireWrappers.System
-            The system for the ATM simulation.
         """
+        Create a system for ATM simulations by combining a protein, a bound ligand, 
+        and a free ligand. The free ligand is displaced away from the protein along a 
+        calculated normal vector until a specified minimal distance threshold is met.
 
-        def _findTranslationVector(system, displacement, protein, ligand):
+        The normal vector is calculated based on the center of mass of the bound ligand and
+        the average position of grid points in the "non-protein" clusters surrounding the binding site.
+        
+        Parameters:
+            protein (BioSimSpace._SireWrappers.Molecule):
+                The protein molecule.
+            ligand_bound (BioSimSpace._SireWrappers.Molecule):
+                The ligand in its bound state.
+            ligand_free (BioSimSpace._SireWrappers.Molecule):
+                The free ligand to be displaced.
+            displacement (BioSimSpace.Types.Length or _Vector):
+                Either a pre-computed displacement vector or a Length placeholder; if not
+                already a _Vector, the displacement will be calculated.
+            align_ligands (bool):
+                If True, align the free ligand to the bound ligand using matching and RMSD alignment.
+        
+        Returns:
+            tuple: (system, prot_index, ligand_bound_index, ligand_free_index, displacement_vector)
+                - system: The combined BioSimSpace system.
+                - prot_index: The index of the protein in the system.
+                - ligand_bound_index: The index of the bound ligand in the system.
+                - ligand_free_index: The index of the free (displaced) ligand in the system.
+                - displacement_vector: The final displacement vector applied to the free ligand.
+        """
+        
+        def find_connected_components_from_coords(coordinates):
+            """
+            Given a set of 3D coordinates (assumed to be grid indices), this function creates a binary occupancy grid,
+            performs connected components labeling, and returns a list of clusters. Each cluster is a NumPy array of the 
+            original coordinates that belong to that connected component.
+            """
+            coords = np.array(coordinates, dtype=int)
+            min_coords = coords.min(axis=0)
+            max_coords = coords.max(axis=0)
+            grid_shape = (max_coords - min_coords) + 1
+            grid = np.zeros(grid_shape, dtype=bool)
+            shifted_coords = coords - min_coords
+            grid[shifted_coords[:, 0], shifted_coords[:, 1], shifted_coords[:, 2]] = True
+            
+            # Define a 6-connected structure in 3D
+            structure = ndimage.generate_binary_structure(3, 1)
+            labeled_grid, num_features = ndimage.label(grid, structure=structure)
+            
+            clusters = []
+            for label in range(1, num_features + 1):
+                indices = np.argwhere(labeled_grid == label)
+                original_coords = indices + min_coords
+                clusters.append(original_coords)
+            return clusters
 
+        def findInitialNormalVector(protein, ligand):
+            """
+            Calculate a normalized vector pointing from the ligand's center-of-mass (binding site) to the average
+            position of grid points in the "non-protein" region surrounding the binding site.
+            
+            The function defines a grid around the ligand's center-of-mass, marks grid points that are distant
+            from any protein or ligand atom (using a search radius), clusters these points, and then computes the 
+            average position of the largest cluster. The vector from the binding site to this average is normalized
+            and returned.
+            """
             from sire.legacy.Maths import Vector
-
-            if not isinstance(system, _System):
-                raise TypeError("system must be a BioSimSpace system")
-            if not isinstance(protein, (_Molecule, type(None))):
-                raise TypeError("protein must be a BioSimSpace molecule")
-            if not isinstance(ligand, (_Molecule, type(None))):
-                raise TypeError("ligand must be a BioSimSpace molecule")
-
-            # Assume that binding sire is the center of mass of the ligand
             binding = _Coordinate(*ligand._getCenterOfMass())
-
-            # Create grid around the binding site
-            # This will act as the search region
             grid_length = _Length(20.0, "angstroms")
-
-            num_edges = 5
-            search_radius = (grid_length / num_edges) / 2
+            num_edges = 20
+            search_radius = _Length(2, "A")
             grid_min = binding - 0.5 * grid_length
             grid_max = binding + 0.5 * grid_length
 
-            non_protein_coords = Vector()
-            # Count grid squares that contain no protein atoms
+            non_protein_coords = Vector()  # To sum candidate grid point coordinates
+            non_protein_coord_array = []
             num_non_prot = 0
 
-            import numpy as np
+            # Get coordinates from protein and ligand (assumed to be in the same reference frame)
+            prot_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()]
+                                    for coord in protein.coordinates()])
+            lig_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()]
+                                for coord in ligand.coordinates()])
+            all_coords = np.concatenate((prot_coords, lig_coords), axis=0)
 
-            # Loop over the grid
+            # Loop over grid points
             for x in np.linspace(grid_min.x().value(), grid_max.x().value(), num_edges):
-                for y in np.linspace(
-                    grid_min.y().value(), grid_max.y().value(), num_edges
-                ):
-                    for z in np.linspace(
-                        grid_min.z().value(), grid_max.z().value(), num_edges
-                    ):
-                        search = (
-                            f"atoms within {search_radius.value()} of ({x}, {y}, {z})"
-                        )
-
-                        try:
-                            protein.search(search)
-                        except:
+                for y in np.linspace(grid_min.y().value(), grid_max.y().value(), num_edges):
+                    for z in np.linspace(grid_min.z().value(), grid_max.z().value(), num_edges):
+                        point = np.array([x, y, z])
+                        distances = np.linalg.norm(all_coords - point, axis=1)
+                        # Select grid points that are farther than search_radius from any atom
+                        if np.min(distances) > search_radius.value():
                             non_protein_coords += Vector(x, y, z)
+                            non_protein_coord_array.append(np.array([x, y, z]))
                             num_non_prot += 1
 
-            non_protein_coords /= num_non_prot
-            non_protein_coords = _Coordinate._from_sire_vector(non_protein_coords)
+            # Cluster the candidate points using connected components
+            components = find_connected_components_from_coords(np.array(non_protein_coord_array), connectivity=6)
+            # Select the largest cluster
+            largest_cluster = components[np.argmax([len(component) for component in components])]
+            avg_pos = np.mean(largest_cluster, axis=0)
+            binding_arr = np.array([binding.x().value(), binding.y().value(), binding.z().value()])
+            # Return normalized vector from binding site to average non-protein coordinate
+            diff = avg_pos - binding_arr
+            return Vector(*(diff / np.linalg.norm(diff)))
+        
 
-            # Now search out alpha carbons in system
-            x = binding.x().angstroms().value()
-            y = binding.y().angstroms().value()
-            z = binding.z().angstroms().value()
-            string = f"(atoms within 10 of {x},{y},{z}) and atomname CA"
+        def findMinimalDisplacementVector(initial_normal_vector, ligand_free, protein, threshold=7.5, step=0.5):
+            """
+            Incrementally translate the free ligand along the given normal vector until the minimum distance
+            between any ligand atom and any protein atom is at least the threshold.
+            """
+            protein_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()] 
+                                        for coord in protein.coordinates()])
 
-            try:
-                search = system.search(string)
-            except:
-                _warnings.warn(
-                    "No alpha carbons found in system, falling back on any carbon atoms."
-                )
-                try:
-                    string = f"(atoms within 10 of {x},{y},{z}) and element C"
-                    search = system.search(string)
-                except:
-                    raise ValueError("No carbon atoms found in system")
+            total_multiplier = 1.0
+            displacement_vector = total_multiplier * initial_normal_vector
 
-            com = _Coordinate(_Length(0, "A"), _Length(0, "A"), _Length(0, "A"))
-            atoms1 = []
-            for atom in search:
-                com += atom.coordinates()
-                atoms1.append(system.getIndex(atom))
-            com /= search.nResults()
+            # Translate ligand_free by the initial displacement vector
+            ligand_free.translate([displacement_vector.x().value(), 
+                                displacement_vector.y().value(), 
+                                displacement_vector.z().value()])
 
-            initial_normal_vector = (non_protein_coords - com).toVector().normalise()
+            ligand_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()] 
+                                    for coord in ligand_free.coordinates()])
+            min_dist = cdist(ligand_coords, protein_coords).min()
+            print(f"Initial multiplier: {total_multiplier}, min_dist: {min_dist}")
 
-            out_of_protein = displacement.value() * initial_normal_vector
-            return out_of_protein
+            # Incrementally translate until min_dist is >= threshold
+            while min_dist < threshold:
+                ligand_free.translate([step * initial_normal_vector.x().value(), 
+                                    step * initial_normal_vector.y().value(), 
+                                    step * initial_normal_vector.z().value()])
+                total_multiplier += step
+                ligand_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()] 
+                                        for coord in ligand_free.coordinates()])
+                min_dist = cdist(ligand_coords, protein_coords).min()
+                print(f"Multiplier: {total_multiplier}, min_dist: {min_dist}")
+            
+            final_displacement = total_multiplier * initial_normal_vector
+            return ligand_free, final_displacement
 
+        # Align the free ligand to the bound ligand if requested.
         if align_ligands:
-            #Align the free ligand to the bound ligand
             mapping = _matchAtoms(ligand_free, ligand_bound)
             ligand_free_aligned = _rmsdAlign(ligand_free, ligand_bound, mapping)
         else:
-            #Ligand free is already aligned
             ligand_free_aligned = ligand_free
+
         prot_lig1 = (protein + ligand_bound).toSystem()
 
-        if isinstance(displacement, _Vector):
-            ligand_free_aligned.translate(
-                [displacement.x(), displacement.y(), displacement.z()]
-            )
-            vec = displacement
-        else:
-            vec = _findTranslationVector(prot_lig1, displacement, protein, ligand_bound)
-            ligand_free_aligned.translate([vec.x(), vec.y(), vec.z()])
-
+        # If displacement is not provided as a _Vector, compute the normal and minimal displacement.
+        if not isinstance(displacement, _Vector):
+            initial_normal_vector = findInitialNormalVector(prot_lig1, displacement, protein, ligand_bound)
+            print("Initial normal vector:", initial_normal_vector)
+            ligand_free_aligned, displacement = findMinimalDisplacementVector(initial_normal_vector, ligand_free_aligned, protein)
+        
+        # Assemble the final system.
         sys = (protein + ligand_bound + ligand_free_aligned).toSystem()
         prot_ind = sys.getIndex(protein)
         lig1_ind = sys.getIndex(ligand_bound)
         lig2_ind = sys.getIndex(ligand_free_aligned)
-        return sys, prot_ind, lig1_ind, lig2_ind, vec
+        return sys, prot_ind, lig1_ind, lig2_ind, displacement
 
     def _systemInfo(self):
         """
