@@ -150,6 +150,7 @@ def _estimate_f_i(ln_q, n_k):
 
 def _sort_folders(work_dir):
     """Sorts folder names by lambda value, ensuring they are read correctly.
+    Only includes folders that contain the required CSV file.
 
     Parameters
     ----------
@@ -168,9 +169,17 @@ def _sort_folders(work_dir):
         if folder.is_dir() and folder.name.startswith("lambda_"):
             try:
                 lambda_val = float(folder.name.split("_")[-1])
+                # Only include folders that have the expected CSV file
+                if (folder / "openmm.csv").exists():
+                    folders[lambda_val] = folder
+                else:
+                    _warnings.warn(f"Skipping {folder} - missing openmm.csv file")
             except ValueError:
                 continue
-            folders[lambda_val] = folder
+    
+    if not folders:
+        raise ValueError(f"No valid lambda folders with CSV files found in {work_dir}")
+        
     return {k: v for k, v in sorted(folders.items())}
 
 
@@ -186,16 +195,29 @@ def _get_inflection_indices(folders):
 
     directions = []
     for folder in folders.values():
-        df = _pd.read_csv(folder / "openmm.csv")
-        direction = df["direction"].values[0]
-        directions.append(direction)
+        try:
+            df = _pd.read_csv(folder / "openmm.csv")
+            direction = df["direction"].values[0]
+            directions.append(direction)
+        except (FileNotFoundError, KeyError) as e:
+            # If file isn't found or doesn't have 'direction' column, skip
+            _warnings.warn(f"Could not read direction from {folder}: {str(e)}")
+            continue
+
+    # If we don't have enough directions, we can't find inflection
+    if len(directions) < 2:
+        raise ValueError("Not enough valid data points to determine inflection indices")
 
     # get the indices at which the direction changes
+    # Define inflection_indices as None otherwise this for loop breaks
+    inflection_indices = None
     for i in range(len(directions) - 1):
         if directions[i] != directions[i + 1]:
             inflection_indices = (i, i + 1)
             break
 
+    if inflection_indices is None:
+        raise ValueError("Could not find inflection point in directions")
     return inflection_indices
 
 
@@ -238,8 +260,14 @@ def analyse_UWHAM(work_dir, ignore_lower, ignore_upper, inflection_indices=None)
     folders = _sort_folders(work_dir)
     if inflection_indices is None:
         inflection_indices = _get_inflection_indices(folders)
+    
     for folder in folders.values():
-        df = _pd.read_csv(folder / "openmm.csv")
+        try:
+            # Try to read the CSV file
+            df = _pd.read_csv(folder / "openmm.csv")
+        except FileNotFoundError:
+            # Skip if file not found - already warned in _sort_folders
+            continue
         # drop the first `ignore_lower` rows of each df
         if ignore_upper is not None:
             df = df.iloc[ignore_lower:ignore_upper]
@@ -260,6 +288,8 @@ def analyse_UWHAM(work_dir, ignore_lower, ignore_upper, inflection_indices=None)
             s = sub_df[1]
             slices[window].append(s)
 
+    if total_states == 0:
+        raise ValueError(f"No valid data found for analysis in {work_dir}")
     # now combine all dataframes in each slice
     for window in slices:
         # get the dataframes for the current window
