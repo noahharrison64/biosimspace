@@ -729,7 +729,7 @@ class ATMSetup:
 
         # If displacement is not provided as a _Vector, compute the normal and minimal displacement.
         if not isinstance(displacement, _Vector):
-            initial_normal_vector = findInitialNormalVector(prot_lig1, displacement, protein, ligand_bound)
+            initial_normal_vector = findInitialNormalVector(protein, ligand_bound)
             print("Initial normal vector:", initial_normal_vector)
             ligand_free_aligned, displacement = findMinimalDisplacementVector(initial_normal_vector, ligand_free_aligned, protein)
         
