@@ -37,19 +37,17 @@ from scipy import ndimage
 from scipy.spatial.distance import cdist
 from sire.legacy import IO as _SireIO
 
+from .. import _is_notebook, _isVerbose, _Utils
 from .._SireWrappers import Molecule as _Molecule
 from .._SireWrappers import System as _System
-from .. import _Utils
-from ..Types import Length as _Length
-from ..Types import Vector as _Vector
-from ..Types import Coordinate as _Coordinate
 from ..Align import matchAtoms as _matchAtoms
 from ..Align import rmsdAlign as _rmsdAlign
 from ..Notebook import View as _View
-from .. import _isVerbose
-from .. import _is_notebook
 from ..Process import OpenMM as _OpenMM
 from ..Process import ProcessRunner as _ProcessRunner
+from ..Types import Coordinate as _Coordinate
+from ..Types import Length as _Length
+from ..Types import Vector as _Vector
 
 if _is_notebook:
     from IPython.display import FileLink as _FileLink
@@ -673,7 +671,7 @@ class ATMSetup:
                             num_non_prot += 1
 
             # Cluster the candidate points using connected components
-            components = find_connected_components_from_coords(np.array(non_protein_coord_array), connectivity=6)
+            components = find_connected_components_from_coords(np.array(non_protein_coord_array))
             # Select the largest cluster
             largest_cluster = components[np.argmax([len(component) for component in components])]
             avg_pos = np.mean(largest_cluster, axis=0)
@@ -683,7 +681,7 @@ class ATMSetup:
             return Vector(*(diff / np.linalg.norm(diff)))
         
 
-        def findMinimalDisplacementVector(initial_normal_vector, ligand_free, protein, threshold=7.5, step=0.5):
+        def findMinimalDisplacementVector(initial_normal_vector, ligand_free, protein, threshold=7, step=0.5):
             """
             Incrementally translate the free ligand along the given normal vector until the minimum distance
             between any ligand atom and any protein atom is at least the threshold.
@@ -702,7 +700,6 @@ class ATMSetup:
             ligand_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()] 
                                     for coord in ligand_free.coordinates()])
             min_dist = cdist(ligand_coords, protein_coords).min()
-            print(f"Initial multiplier: {total_multiplier}, min_dist: {min_dist}")
 
             # Incrementally translate until min_dist is >= threshold
             while min_dist < threshold:
@@ -713,10 +710,8 @@ class ATMSetup:
                 ligand_coords = np.array([[coord.x().value(), coord.y().value(), coord.z().value()] 
                                         for coord in ligand_free.coordinates()])
                 min_dist = cdist(ligand_coords, protein_coords).min()
-                print(f"Multiplier: {total_multiplier}, min_dist: {min_dist}")
-            
             final_displacement = total_multiplier * initial_normal_vector
-            return ligand_free, final_displacement
+            return ligand_free, _Vector(final_displacement.x().value(), final_displacement.y().value(), final_displacement.z().value())
 
         # Align the free ligand to the bound ligand if requested.
         if align_ligands:
@@ -725,12 +720,11 @@ class ATMSetup:
         else:
             ligand_free_aligned = ligand_free
 
-        prot_lig1 = (protein + ligand_bound).toSystem()
+        # prot_lig1 = (protein + ligand_bound).toSystem()
 
         # If displacement is not provided as a _Vector, compute the normal and minimal displacement.
         if not isinstance(displacement, _Vector):
             initial_normal_vector = findInitialNormalVector(protein, ligand_bound)
-            print("Initial normal vector:", initial_normal_vector)
             ligand_free_aligned, displacement = findMinimalDisplacementVector(initial_normal_vector, ligand_free_aligned, protein)
         
         # Assemble the final system.
